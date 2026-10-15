@@ -76,7 +76,7 @@ export default function App() {
     const [batchQueue, setBatchQueue] = useState([]);
     const [isBatchProcessing, setIsBatchProcessing] = useState(false);
 
-    // Optimized Model Loader (WebGPU + 8-Bit Quantization + Deduplicated Promise)
+    // 1. Fixed Model Loader (Uses Multi-threaded WASM / WebGPU + Clean Precision)
     const loadModel = useCallback(async (targetType = modelType, silent = false) => {
         if (modelRef.current && processorRef.current && currentLoadedModelRef.current === targetType) {
             return;
@@ -91,9 +91,14 @@ export default function App() {
                 setModelReady(false);
                 if (!silent) setIsLoading(true);
 
+                // Configure ONNX WASM to use maximum available CPU threads
+                if (env.backends?.onnx?.wasm) {
+                    env.backends.onnx.wasm.numThreads = navigator.hardwareConcurrency || 4;
+                    env.backends.onnx.wasm.simd = true;
+                }
+
                 const modelId = targetType === 'modnet' ? 'Xenova/modnet' : 'briaai/RMBG-1.4';
 
-                // Check for WebGPU hardware acceleration
                 let device = 'wasm';
         if (typeof navigator !== 'undefined' && navigator.gpu) {
             try {
@@ -103,17 +108,20 @@ export default function App() {
                 device = 'wasm';
             }
         }
-        setHwDevice(device.toUpperCase());
+
+        const threads = window.crossOriginIsolated ? `${navigator.hardwareConcurrency || 4}-Core` : '1-Core';
+        setHwDevice(device === 'webgpu' ? 'WEBGPU' : `WASM ${threads}`);
 
         if (!silent) {
             setStatusText(
-                `Loading ${targetType === 'modnet' ? 'Fast Portrait' : 'High-Precision'} AI (${device.toUpperCase()})...`
+                `Loading ${targetType === 'modnet' ? 'Fast Portrait' : 'High-Precision'} AI...`
             );
         }
 
+        // IMPORTANT: Use fp16 on WebGPU, or fp32 on WASM so RMBG-1.4 doesn't lose alpha accuracy!
         modelRef.current = await AutoModel.from_pretrained(modelId, {
             device,
-            dtype: 'q8', // 8-bit quantized: 4x smaller & 3x faster
+            dtype: device === 'webgpu' ? 'fp16' : 'fp32',
             progress_callback: (d) => {
                 if (d.status === 'progress' && d.progress) {
                     setProgress(Math.round(d.progress));
@@ -132,36 +140,22 @@ export default function App() {
         return loadingPromiseRef.current;
     }, [modelType]);
 
-    // Pre-warm AI model in the background on initial page load
-    useEffect(() => {
-        loadModel(modelType, true).catch(console.error);
-    }, [modelType, loadModel]);
-
-    // Helper: Run fast inference on downscaled canvas, return full-res mask
+    // 2. Fixed Segmentation Pipeline (Converts RGBA -> 3-Channel RGB + Proper Tensor Normalization)
     const runFastSegmentation = async (imgElement) => {
-        const MAX_INFERENCE_DIM = modelType === 'modnet' ? 512 : 1024;
-        let infW = imgElement.naturalWidth;
-        let infH = imgElement.naturalHeight;
+        // Load image and explicitly convert 4-channel RGBA to 3-channel RGB (.rgb())
+        // This fixes the missing face/body bug!
+        const rawImg = (await RawImage.fromURL(imgElement.src)).rgb();
 
-        if (infW > MAX_INFERENCE_DIM || infH > MAX_INFERENCE_DIM) {
-            const scale = MAX_INFERENCE_DIM / Math.max(infW, infH);
-            infW = Math.round(infW * scale);
-            infH = Math.round(infH * scale);
-        }
-
-        const offCanvas = document.createElement('canvas');
-        offCanvas.width = infW;
-        offCanvas.height = infH;
-        offCanvas.getContext('2d').drawImage(imgElement, 0, 0, infW, infH);
-
-        const rawImg = await RawImage.fromCanvas(offCanvas);
         const { pixel_values } = await processorRef.current(rawImg);
         const { output } = await modelRef.current({ input: pixel_values });
 
-        const mask = await RawImage.fromTensor(output[0].mul(255).to('uint8')).resize(
+        // Normalize tensor output safely between [0, 255]
+        const maskTensor = output[0].mul(255).clamp(0, 255).to('uint8');
+        const mask = await RawImage.fromTensor(maskTensor).resize(
             imgElement.naturalWidth,
             imgElement.naturalHeight
         );
+
         return new Uint8ClampedArray(mask.data);
     };
 
