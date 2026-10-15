@@ -473,7 +473,7 @@ export default function App() {
             </div>
             <div>
             <span className="font-bold text-lg tracking-tight bg-gradient-to-r from-white via-indigo-200 to-slate-400 bg-clip-text text-transparent">
-            CleanCut Studio
+            Peelr Studio
             </span>
             <span className="text-[10px] px-2 py-0.5 ml-2 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium uppercase tracking-wide">
             React + Tailwind v4
