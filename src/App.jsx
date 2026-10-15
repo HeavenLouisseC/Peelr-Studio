@@ -4,7 +4,7 @@ import JSZip from 'jszip';
 import {
     Sparkles, Layers, Wand2, Loader, Archive, Move, Split,
     Paintbrush, Undo2, Redo2, ChevronsLeftRight, Contact,
-    Sliders, Aperture, Image as ImageIcon, Download, Check
+    Sliders, Aperture, Image as ImageIcon, Download, Check, Zap
 } from 'lucide-react';
 
 // Disable local model check so it fetches directly from HuggingFace CDN
@@ -14,6 +14,8 @@ export default function App() {
     // AI Model Refs
     const modelRef = useRef(null);
     const processorRef = useRef(null);
+    const currentLoadedModelRef = useRef(null);
+    const loadingPromiseRef = useRef(null);
 
     // Canvas & DOM Refs
     const outputCanvasRef = useRef(null);
@@ -30,6 +32,9 @@ export default function App() {
     const [canRedo, setCanRedo] = useState(false);
 
     // App UI State
+    const [modelType, setModelType] = useState('rmbg'); // 'rmbg' | 'modnet'
+    const [modelReady, setModelReady] = useState(false);
+    const [hwDevice, setHwDevice] = useState('WASM');
     const [hasImage, setHasImage] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
     const [statusText, setStatusText] = useState('');
@@ -71,17 +76,93 @@ export default function App() {
     const [batchQueue, setBatchQueue] = useState([]);
     const [isBatchProcessing, setIsBatchProcessing] = useState(false);
 
-    // Load RMBG-1.4 Model
-    const loadModel = async () => {
-        if (modelRef.current && processorRef.current) return;
-        setIsLoading(true);
-        setStatusText('Loading RMBG-1.4 AI Model (~40MB, cached after 1st run)...');
-        modelRef.current = await AutoModel.from_pretrained('briaai/RMBG-1.4', {
+    // Optimized Model Loader (WebGPU + 8-Bit Quantization + Deduplicated Promise)
+    const loadModel = useCallback(async (targetType = modelType, silent = false) => {
+        if (modelRef.current && processorRef.current && currentLoadedModelRef.current === targetType) {
+            return;
+        }
+
+        if (loadingPromiseRef.current) {
+            return loadingPromiseRef.current;
+        }
+
+        loadingPromiseRef.current = (async () => {
+            try {
+                setModelReady(false);
+                if (!silent) setIsLoading(true);
+
+                const modelId = targetType === 'modnet' ? 'Xenova/modnet' : 'briaai/RMBG-1.4';
+
+                // Check for WebGPU hardware acceleration
+                let device = 'wasm';
+        if (typeof navigator !== 'undefined' && navigator.gpu) {
+            try {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (adapter) device = 'webgpu';
+            } catch {
+                device = 'wasm';
+            }
+        }
+        setHwDevice(device.toUpperCase());
+
+        if (!silent) {
+            setStatusText(
+                `Loading ${targetType === 'modnet' ? 'Fast Portrait' : 'High-Precision'} AI (${device.toUpperCase()})...`
+            );
+        }
+
+        modelRef.current = await AutoModel.from_pretrained(modelId, {
+            device,
+            dtype: 'q8', // 8-bit quantized: 4x smaller & 3x faster
             progress_callback: (d) => {
-                if (d.status === 'progress') setProgress(Math.round(d.progress));
+                if (d.status === 'progress' && d.progress) {
+                    setProgress(Math.round(d.progress));
+                }
             }
         });
-        processorRef.current = await AutoProcessor.from_pretrained('briaai/RMBG-1.4');
+
+        processorRef.current = await AutoProcessor.from_pretrained(modelId);
+        currentLoadedModelRef.current = targetType;
+        setModelReady(true);
+            } finally {
+                loadingPromiseRef.current = null;
+            }
+        })();
+
+        return loadingPromiseRef.current;
+    }, [modelType]);
+
+    // Pre-warm AI model in the background on initial page load
+    useEffect(() => {
+        loadModel(modelType, true).catch(console.error);
+    }, [modelType, loadModel]);
+
+    // Helper: Run fast inference on downscaled canvas, return full-res mask
+    const runFastSegmentation = async (imgElement) => {
+        const MAX_INFERENCE_DIM = modelType === 'modnet' ? 512 : 1024;
+        let infW = imgElement.naturalWidth;
+        let infH = imgElement.naturalHeight;
+
+        if (infW > MAX_INFERENCE_DIM || infH > MAX_INFERENCE_DIM) {
+            const scale = MAX_INFERENCE_DIM / Math.max(infW, infH);
+            infW = Math.round(infW * scale);
+            infH = Math.round(infH * scale);
+        }
+
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = infW;
+        offCanvas.height = infH;
+        offCanvas.getContext('2d').drawImage(imgElement, 0, 0, infW, infH);
+
+        const rawImg = await RawImage.fromCanvas(offCanvas);
+        const { pixel_values } = await processorRef.current(rawImg);
+        const { output } = await modelRef.current({ input: pixel_values });
+
+        const mask = await RawImage.fromTensor(output[0].mul(255).to('uint8')).resize(
+            imgElement.naturalWidth,
+            imgElement.naturalHeight
+        );
+        return new Uint8ClampedArray(mask.data);
     };
 
     // Master Canvas Render Pipeline
@@ -237,30 +318,30 @@ export default function App() {
         const processFile = async (file) => {
             try {
                 setIsLoading(true);
-                setStatusText('Segmenting foreground with AI...');
-                setProgress(50);
+                setStatusText('Preparing AI model...');
+                setProgress(25);
 
-                await loadModel();
+                await loadModel(modelType, false);
+
+                setStatusText('Removing background...');
+                setProgress(70);
+
+                // Allow UI to paint progress bar before heavy tensor op
+                await new Promise((r) => setTimeout(r, 30));
 
                 const imgURL = URL.createObjectURL(file);
-                const rawImg = await RawImage.fromURL(imgURL);
+                const img = new Image();
+                img.src = imgURL;
+                await new Promise((r) => (img.onload = r));
+                origImgRef.current = img;
 
-                const { pixel_values } = await processorRef.current(rawImg);
-                const { output } = await modelRef.current({ input: pixel_values });
-
-                const mask = await RawImage.fromTensor(output[0].mul(255).to('uint8')).resize(rawImg.width, rawImg.height);
-                rawMaskRef.current = new Uint8ClampedArray(mask.data);
+                rawMaskRef.current = await runFastSegmentation(img);
 
                 undoStackRef.current = [];
                 redoStackRef.current = [];
                 setCanUndo(false);
                 setCanRedo(false);
                 setTransform({ x: 0, y: 0, scale: 1, rotation: 0 });
-
-                const img = new Image();
-                img.src = imgURL;
-                await new Promise((r) => (img.onload = r));
-                origImgRef.current = img;
 
                 setIsLoading(false);
                 setHasImage(true);
@@ -407,27 +488,25 @@ export default function App() {
 
         const processBatchAll = async () => {
             setIsBatchProcessing(true);
-            await loadModel();
+            await loadModel(modelType, false);
             const updated = [...batchQueue];
 
             for (let i = 0; i < updated.length; i++) {
                 if (!updated[i].processed) {
-                    const rawImg = await RawImage.fromURL(updated[i].url);
-                    const { pixel_values } = await processorRef.current(rawImg);
-                    const { output } = await modelRef.current({ input: pixel_values });
-                    const mask = await RawImage.fromTensor(output[0].mul(255).to('uint8')).resize(rawImg.width, rawImg.height);
-
-                    const c = document.createElement('canvas');
-                    c.width = rawImg.width;
-                    c.height = rawImg.height;
-                    const cx = c.getContext('2d');
                     const tImg = new Image();
                     tImg.src = updated[i].url;
                     await new Promise((r) => (tImg.onload = r));
+
+                    const maskData = await runFastSegmentation(tImg);
+
+                    const c = document.createElement('canvas');
+                    c.width = tImg.naturalWidth;
+                    c.height = tImg.naturalHeight;
+                    const cx = c.getContext('2d');
                     cx.drawImage(tImg, 0, 0);
 
                     const idata = cx.getImageData(0, 0, c.width, c.height);
-                    for (let m = 0; m < mask.data.length; m++) idata.data[m * 4 + 3] = mask.data[m];
+                    for (let m = 0; m < maskData.length; m++) idata.data[m * 4 + 3] = maskData[m];
                     cx.putImageData(idata, 0, 0);
 
                     updated[i].blob = await new Promise((r) => c.toBlob(r, 'image/png'));
@@ -446,14 +525,14 @@ export default function App() {
             const content = await zip.generateAsync({ type: 'blob' });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(content);
-            a.download = 'cleancut_batch.zip';
+            a.download = 'peelr_batch.zip';
             a.click();
         };
 
         const downloadArtwork = () => {
             if (!outputCanvasRef.current) return;
             const a = document.createElement('a');
-            a.download = idMode ? 'id-photo.png' : 'cleancut-artwork.png';
+            a.download = idMode ? 'id-photo.png' : 'peelr-artwork.png';
             a.href = outputCanvasRef.current.toDataURL('image/png');
             a.click();
         };
@@ -476,20 +555,35 @@ export default function App() {
             Peelr Studio
             </span>
             <span className="text-[10px] px-2 py-0.5 ml-2 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium uppercase tracking-wide">
-            React + Tailwind v4
+            {modelReady ? `AI Ready (${hwDevice})` : 'Warming AI...'}
             </span>
             </div>
             </div>
-            <div className="flex items-center gap-3 text-xs text-slate-400">
-            <span className="hidden sm:inline bg-slate-800/80 px-2.5 py-1 rounded-md border border-slate-700">
-            Paste anywhere: <kbd className="font-mono text-slate-300">Ctrl+V</kbd>
+
+            <div className="flex items-center gap-2.5 text-xs text-slate-400">
+            {/* Speed / Model Switcher */}
+            <div className="flex items-center gap-1.5 bg-slate-800/90 px-2.5 py-1.5 rounded-lg border border-slate-700">
+            <Zap className="w-3.5 h-3.5 text-amber-400" />
+            <select
+            value={modelType}
+            onChange={(e) => setModelType(e.target.value)}
+            className="bg-transparent text-slate-200 text-xs focus:outline-none cursor-pointer"
+            >
+            <option value="rmbg" className="bg-slate-900">High Detail (RMBG q8)</option>
+            <option value="modnet" className="bg-slate-900">Fast Portrait (MODNet)</option>
+            </select>
+            </div>
+
+            <span className="hidden md:inline bg-slate-800/80 px-2.5 py-1.5 rounded-lg border border-slate-700">
+            Paste: <kbd className="font-mono text-slate-300">Ctrl+V</kbd>
             </span>
+
             <button
             onClick={() => setShowBatch(!showBatch)}
             className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1.5 cursor-pointer"
             >
             <Layers className="w-3.5 h-3.5" />
-            <span>Batch Queue</span>
+            <span className="hidden sm:inline">Batch Queue</span>
             {batchQueue.length > 0 && (
                 <span className="px-1.5 py-0.2 rounded-full bg-indigo-500 text-[10px] text-white font-bold">
                 {batchQueue.length}
@@ -553,14 +647,14 @@ export default function App() {
                 <button
                 onClick={processBatchAll}
                 disabled={isBatchProcessing}
-                className="text-xs px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 font-medium rounded-lg transition disabled:opacity-50"
+                className="text-xs px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 font-medium rounded-lg transition disabled:opacity-50 cursor-pointer"
                 >
                 {isBatchProcessing ? 'Processing...' : 'Process All'}
                 </button>
                 <button
                 onClick={downloadBatchZip}
                 disabled={!batchQueue.some((i) => i.processed)}
-                className="text-xs px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 font-medium rounded-lg transition disabled:opacity-50"
+                className="text-xs px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 font-medium rounded-lg transition disabled:opacity-50 cursor-pointer"
                 >
                 Download ZIP
                 </button>
@@ -643,7 +737,7 @@ export default function App() {
                     min="5"
                     max="80"
                     value={brushSize}
-                    onChange={(e) => setBrushSize( parseInt(e.target.value) )}
+                    onChange={(e) => setBrushSize(parseInt(e.target.value))}
                     className="w-20 accent-indigo-500 cursor-pointer"
                     />
                     </div>
